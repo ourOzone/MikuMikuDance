@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>Miku AR</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: sans-serif; }
+    #wrap { position: relative; display: inline-block; }
+    video { display: block; max-width: 90vw; max-height: 90vh; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    #status { margin-top: 10px; font-size: 0.85rem; color: #888; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <video id="video" src="./vid2.mp4" controls loop></video>
+    <canvas id="cv"></canvas>
+  </div>
+  <div id="status">모델 로딩 중...</div>
+
+  <script type="importmap">
+  { "imports": {
+    "three":         "https://cdn.jsdelivr.net/npm/three@0.168.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.168.0/examples/jsm/"
+  }}
+  </script>
+
+  <script type="module">
+    import * as THREE               from 'three';
+    import { MMDLoader }            from 'three/addons/loaders/MMDLoader.js';
+    import { MMDAnimationHelper }   from 'three/addons/animation/MMDAnimationHelper.js';
+
+    const status = document.getElementById('status');
+
+    /* ── cam_data 로드 ─────────────────────────────── */
+    const d = await fetch('./cam_data.txt').then(r => r.json());
+    const { K, img_width: IW, img_height: IH } = d.calibration;
+    const { fps }                               = d.video;
+    const { shape: [BW, BH], cell_size: CS }    = d.board;
+
+    // idx → {rvec, tvec} 빠른 조회
+    const frameMap  = new Map(d.frames.map(f => [f.idx, f]));
+    const frameIdxs = d.frames.map(f => f.idx).sort((a, b) => a - b);
+
+    /* ── Three.js ──────────────────────────────────── */
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('cv');
+
+    const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+    renderer.setClearColor(0x000000, 0);
+
+    const scene  = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera();
+    camera.matrixAutoUpdate = false;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+    const dirLight = new THREE.DirectionalLight(0xffeedd, 1.0);
+    dirLight.position.set(1, 2, 2);
+    scene.add(dirLight);
+
+    /* ── 체스보드 중심 좌표 (OpenCV 월드) ─────────── */
+    const cx = (BW - 1) / 2 * CS;  // 예: 0.09 m
+    const cy = (BH - 1) / 2 * CS + 0.05;  // 예: 0.06 m
+
+    /* ── 미쿠 로드 ─────────────────────────────────── */
+    let miku = null, helper = null;
+    const loader = new MMDLoader();
+
+    loader.load(
+      './YYB Hatsune Miku_default/YYB Hatsune Miku_default_1.0ver.pmx',
+      mesh => {
+        miku = mesh;
+        miku.visible = false;
+
+        // 체스보드 중심에 배치, 보드 면에 수직으로 세우기
+        // rotX(+π/2): MMD y(위) → OpenCV 월드 -z (카메라 방향 = 보드 위쪽)
+        miku.position.set(cx, cy, 0);
+        miku.rotation.set(-Math.PI / 2, 0, 0);
+
+        // 스케일: MMD는 cm 단위, 보드 8칸 높이로 조정
+        miku.scale.setScalar((CS * 8 / 158) * 5);
+
+        scene.add(miku);
+        status.textContent = '애니메이션 로딩 중...';
+
+        loader.loadAnimation('./Triple Baka/full.vmd', miku, vmd => {
+          helper = new MMDAnimationHelper();
+          try        { helper.add(miku, { animation: vmd, physics: true  }); }
+          catch (e)  { helper.add(miku, { animation: vmd, physics: false }); }
+          status.textContent = '재생 버튼을 눌러주세요';
+        },
+        null,
+        () => { status.textContent = '준비 완료 (애니메이션 없음)'; }
+        );
+      },
+      null,
+      err => { status.textContent = '모델 로드 실패: ' + err; }
+    );
+
+    /* ── Rodrigues 벡터 → 3×3 회전행렬 ────────────── */
+    function rodrigues([rx, ry, rz]) {
+      const θ = Math.sqrt(rx*rx + ry*ry + rz*rz);
+      if (θ < 1e-10) return [[1,0,0],[0,1,0],[0,0,1]];
+      const [nx, ny, nz] = [rx/θ, ry/θ, rz/θ];
+      const c = Math.cos(θ), s = Math.sin(θ), t = 1 - c;
+      return [
+        [ t*nx*nx+c,     t*nx*ny-s*nz, t*nx*nz+s*ny ],
+        [ t*nx*ny+s*nz,  t*ny*ny+c,    t*ny*nz-s*nx ],
+        [ t*nx*nz-s*ny,  t*ny*nz+s*nx, t*nz*nz+c    ]
+      ];
+    }
+
+    /* ── OpenCV rvec/tvec → three.js 카메라 월드 행렬 ─
+     *  OpenCV: x우, y하, z전방  →  OpenGL: x우, y상, z후방
+     *  변환:  flip = diag(1, -1, -1)
+     *  R_c2w = Rᵀ · flip   (col1, col2 부호반전)
+     *  t_c2w = -Rᵀ · t
+     * ─────────────────────────────────────────────── */
+    function buildCamMat(rvec, tvec) {
+      const R  = rodrigues(rvec);
+      const Rt = R[0].map((_, i) => R.map(r => r[i]));          // R 전치
+      const Rc = Rt.map(row => [row[0], -row[1], -row[2]]);      // × flip
+      const tc = [0, 1, 2].map(i =>
+        -Rt[i].reduce((s, v, j) => s + v * tvec[j], 0)
+      );
+      const m = new THREE.Matrix4();
+      m.set(
+        Rc[0][0], Rc[0][1], Rc[0][2], tc[0],
+        Rc[1][0], Rc[1][1], Rc[1][2], tc[1],
+        Rc[2][0], Rc[2][1], Rc[2][2], tc[2],
+        0,        0,        0,        1
+      );
+      return m;
+    }
+
+    /* ── 이진탐색: 현재 프레임과 가장 가까운 검출 프레임 ── */
+    function nearestFrame(idx) {
+      let lo = 0, hi = frameIdxs.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (frameIdxs[mid] < idx) lo = mid + 1; else hi = mid;
+      }
+      const cands = lo > 0 ? [frameIdxs[lo - 1], frameIdxs[lo]] : [frameIdxs[lo]];
+      const best  = cands.reduce((a, b) =>
+        Math.abs(a - idx) <= Math.abs(b - idx) ? a : b
+      );
+      return { data: frameMap.get(best), dist: Math.abs(best - idx) };
+    }
+
+    /* ── 카메라 투영 + 렌더러 사이즈 동기화 ─────────── */
+    function resize() {
+      const w = video.clientWidth, h = video.clientHeight;
+      if (!w || !h) return;
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(w, h, false);  // CSS 변경 없이 픽셀 버퍼만 조정
+      // 캘리브레이션 K에서 수직 FOV 계산
+      camera.fov    = 2 * Math.atan(IH / (2 * K[1][1])) * (180 / Math.PI);
+      camera.aspect = IW / IH;
+      camera.near   = 0.001;
+      camera.far    = 100;
+      camera.updateProjectionMatrix();
+    }
+    video.addEventListener('loadedmetadata', resize);
+    window.addEventListener('resize', resize);
+
+    /* ── 렌더 루프 ──────────────────────────────────── */
+    let lastNow = 0;
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min((now - lastNow) / 1000, 0.05);
+      lastNow = now;
+
+      if (!miku) { renderer.render(scene, camera); return; }
+
+      // 현재 영상 프레임에 해당하는 카메라 데이터 조회
+      const frameIdx       = Math.round(video.currentTime * fps);
+      const { data, dist } = nearestFrame(frameIdx);
+
+      // 체스보드가 보이지 않는 구간(15프레임 이상 gap)은 미쿠 숨김
+      if (dist > 15 || !data) {
+        miku.visible = false;
+      } else {
+        miku.visible = true;
+        const mat = buildCamMat(data.rvec, data.tvec);
+        camera.matrix.copy(mat);
+        camera.matrix.decompose(camera.position, camera.quaternion, camera.scale);
+        camera.matrixWorldNeedsUpdate = true;
+      }
+
+      // 영상 재생 중일 때만 애니메이션 진행
+      if (!video.paused && !video.ended && helper) helper.update(delta);
+
+      renderer.render(scene, camera);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
